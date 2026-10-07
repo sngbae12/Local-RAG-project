@@ -35,6 +35,13 @@ from ingest_journal import clear_record, list_records, read_record, write_record
 
 logger = logging.getLogger(__name__)
 
+PRE_CONFIRM_PHASES = {"started", "pending_added", "file_swapped"}
+CONFIRMED_PHASES = {"accepted", "cleanup", "committed"}
+CLEANUP_WARNING = (
+    "문서는 새 버전으로 저장됐지만 이전 데이터 정리에 실패했습니다. "
+    "서버를 다시 시작하면 정리를 이어서 시도합니다."
+)
+
 SYSTEM_PROMPT = (
     "당신은 PDF 문서 기반 질의응답 도우미입니다. "
     "반드시 아래 [참고 문서] 내용만으로 답하세요. "
@@ -242,9 +249,32 @@ class RAGEngine:
         except Exception:
             return 0
 
-    def _is_visible_meta(self, meta: Optional[Dict[str, Any]]) -> bool:
-        status = (meta or {}).get("ingest_status") or "committed"
-        return status == "committed"
+    def _confirmed_ingest_map(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for record in list_records():
+            phase = record.get("phase")
+            filename = record.get("filename")
+            ingest_id = record.get("ingest_id")
+            if phase in CONFIRMED_PHASES and filename and ingest_id:
+                mapping[filename] = ingest_id
+        return mapping
+
+    def _is_visible_meta(
+        self,
+        meta: Optional[Dict[str, Any]],
+        confirmed: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        meta = meta or {}
+        status = meta.get("ingest_status") or "committed"
+        if status != "committed":
+            return False
+        filename = meta.get("filename") or Path(str(meta.get("source", ""))).name
+        if confirmed is None:
+            confirmed = self._confirmed_ingest_map()
+        active = confirmed.get(filename) if filename else None
+        if active:
+            return meta.get("ingest_id") == active
+        return True
 
     def list_files(self) -> List[Dict[str, Any]]:
         if self.vectorstore is None:
@@ -254,9 +284,10 @@ class RAGEngine:
                 data = self.vectorstore.get(include=["metadatas"])
             except Exception:
                 return []
+            confirmed = self._confirmed_ingest_map()
         counts: Dict[str, int] = {}
         for meta in data.get("metadatas") or []:
-            if not self._is_visible_meta(meta):
+            if not self._is_visible_meta(meta, confirmed):
                 continue
             name = (meta or {}).get("filename") or Path((meta or {}).get("source", "")).name
             if name:
@@ -273,19 +304,23 @@ class RAGEngine:
 
         added_files: List[str] = []
         skipped: List[Dict[str, str]] = []
+        warnings: List[Dict[str, str]] = []
         total_chunks = 0
 
         for temp_path, filename in items:
             try:
-                chunk_count = self._ingest_one(temp_path, filename, progress)
+                chunk_count, warning = self._ingest_one(temp_path, filename, progress)
                 added_files.append(filename)
                 total_chunks += chunk_count
+                if warning:
+                    warnings.append({"name": filename, "reason": warning})
             except Exception as exc:
                 skipped.append({"name": filename, "reason": str(exc)})
 
         return {
             "added": added_files,
             "skipped": skipped,
+            "warnings": warnings,
             "chunk_count": total_chunks,
             "files": self.list_files(),
         }
@@ -299,7 +334,7 @@ class RAGEngine:
         temp_path: Path,
         filename: str,
         progress: Optional[Callable[[str], None]] = None,
-    ) -> int:
+    ) -> Tuple[int, Optional[str]]:
         self._notify(progress, "extract")
         loader = PyPDFLoader(str(temp_path))
         pages = loader.load()
@@ -318,8 +353,8 @@ class RAGEngine:
             raise RuntimeError("분할할 텍스트가 없습니다.")
 
         dest = UPLOAD_DIR / filename
-        self._commit_chunks_and_file(filename, chunks, temp_path, dest, progress)
-        return len(chunks)
+        warning = self._commit_chunks_and_file(filename, chunks, temp_path, dest, progress)
+        return len(chunks), warning
 
     def _commit_chunks_and_file(
         self,
@@ -328,7 +363,7 @@ class RAGEngine:
         temp_path: Path,
         dest: Path,
         progress: Optional[Callable[[str], None]] = None,
-    ) -> None:
+    ) -> Optional[str]:
         assert self.vectorstore is not None
         ingest_id = uuid.uuid4().hex
         new_ids = [f"ing-{ingest_id}-{idx:06d}" for idx in range(len(chunks))]
@@ -345,6 +380,7 @@ class RAGEngine:
             "dest": str(dest),
             "backup_path": None,
             "new_ids": new_ids,
+            "old_ids": [],
         }
         write_record(filename, record)
         file_swapped = False
@@ -371,21 +407,28 @@ class RAGEngine:
                 write_record(filename, record)
 
                 self._mark_committed(new_ids, filename, ingest_id)
-                old_ids = self._existing_ids_for_file(filename, exclude_ids=set(new_ids))
-                if old_ids:
-                    self.vectorstore.delete(ids=old_ids)
-                record["phase"] = "committed"
+                old_ids = self._leftover_ids(filename, ingest_id)
+                record["old_ids"] = old_ids
+                record["phase"] = "accepted"
                 write_record(filename, record)
-                self._cleanup_success(filename, record)
             except Exception as exc:
-                self._rollback_replace(filename, new_ids, record, dest, file_swapped)
+                try:
+                    self._rollback_replace(filename, new_ids, record, dest, file_swapped)
+                except Exception:
+                    raise
                 raise RuntimeError(f"문서 교체에 실패해 이전 문서를 유지합니다: {exc}") from exc
 
-    def _cleanup_success(self, filename: str, record: Dict[str, Any]) -> None:
-        backup = record.get("backup_path")
-        if backup:
-            Path(backup).unlink(missing_ok=True)
-        clear_record(filename)
+            try:
+                return self._cleanup_accepted(filename, record)
+            except Exception as exc:
+                logger.exception("post-accept cleanup failed for %s", filename)
+                record["phase"] = "cleanup"
+                record["cleanup_error"] = str(exc)
+                try:
+                    write_record(filename, record)
+                except Exception:
+                    logger.exception("could not persist cleanup record for %s", filename)
+                return CLEANUP_WARNING
 
     def _delete_ids_quiet(self, ids: List[str]) -> None:
         if not ids or self.vectorstore is None:
@@ -456,6 +499,20 @@ class RAGEngine:
         metas = existing.get("metadatas") or []
         return [doc_id for doc_id, meta in zip(ids, metas) if (meta or {}).get("ingest_id") == ingest_id]
 
+    def _leftover_ids(self, filename: str, ingest_id: str) -> List[str]:
+        assert self.vectorstore is not None
+        try:
+            existing = self.vectorstore.get(where={"filename": filename}, include=["metadatas"])
+        except Exception:
+            return []
+        ids = existing.get("ids") or []
+        metas = existing.get("metadatas") or []
+        leftover = []
+        for doc_id, meta in zip(ids, metas):
+            if (meta or {}).get("ingest_id") != ingest_id:
+                leftover.append(doc_id)
+        return leftover
+
     def _existing_ids_for_file(self, filename: str, exclude_ids: Optional[set] = None) -> List[str]:
         assert self.vectorstore is not None
         exclude_ids = exclude_ids or set()
@@ -467,43 +524,113 @@ class RAGEngine:
         return [doc_id for doc_id in ids if doc_id not in exclude_ids]
 
     def _mark_committed(self, ids: List[str], filename: str, ingest_id: str) -> None:
+        self._update_metas(ids, ingest_status="committed", filename=filename, ingest_id=ingest_id)
+
+    def _mark_superseded(self, ids: List[str]) -> None:
+        self._update_metas(ids, ingest_status="superseded")
+
+    def _update_metas(
+        self,
+        ids: List[str],
+        ingest_status: str,
+        filename: Optional[str] = None,
+        ingest_id: Optional[str] = None,
+    ) -> None:
         assert self.vectorstore is not None
         if not ids:
             return
         try:
             data = self.vectorstore.get(ids=ids, include=["metadatas"])
+            found_ids = data.get("ids") or []
             metas = data.get("metadatas") or []
         except Exception:
+            found_ids = ids
             metas = [None] * len(ids)
+        if not found_ids:
+            return
         updated = []
         for meta in metas:
             item = dict(meta or {})
-            item["filename"] = filename
-            item["source"] = filename
-            item["ingest_id"] = ingest_id
-            item["ingest_status"] = "committed"
+            if filename:
+                item["filename"] = filename
+                item["source"] = filename
+            if ingest_id:
+                item["ingest_id"] = ingest_id
+            item["ingest_status"] = ingest_status
             updated.append(item)
-        self.vectorstore._collection.update(ids=ids, metadatas=updated)
+        self.vectorstore._collection.update(ids=found_ids, metadatas=updated)
 
-    def _complete_recorded_swap(self, record: Dict[str, Any]) -> None:
+    def _cleanup_accepted(self, filename: str, record: Dict[str, Any]) -> Optional[str]:
+        ingest_id = record.get("ingest_id") or ""
+        leftover: List[str] = []
+        remaining_old = self._leftover_ids(filename, ingest_id)
+        record["old_ids"] = remaining_old
+
+        if remaining_old:
+            try:
+                self._mark_superseded(remaining_old)
+            except Exception as exc:
+                leftover.append(f"supersede:{exc}")
+            try:
+                self._delete_ids_quiet(remaining_old)
+                remaining_old = self._leftover_ids(filename, ingest_id)
+                record["old_ids"] = remaining_old
+                if remaining_old:
+                    leftover.append("old_chunks")
+            except Exception as exc:
+                remaining_old = self._leftover_ids(filename, ingest_id)
+                record["old_ids"] = remaining_old
+                leftover.append(f"old_chunks:{exc}")
+
+        backup = record.get("backup_path")
+        if backup:
+            backup_path = Path(backup)
+            try:
+                backup_path.unlink(missing_ok=True)
+                if backup_path.exists():
+                    leftover.append("backup")
+                else:
+                    record["backup_path"] = None
+            except Exception as exc:
+                leftover.append(f"backup:{exc}")
+
+        if leftover:
+            record["phase"] = "cleanup"
+            record["cleanup_error"] = ";".join(leftover)
+            write_record(filename, record)
+            return f"{CLEANUP_WARNING} ({'; '.join(leftover)})"
+
+        try:
+            clear_record(filename)
+        except Exception as exc:
+            record["phase"] = "cleanup"
+            record["cleanup_error"] = f"journal:{exc}"
+            try:
+                write_record(filename, record)
+            except Exception:
+                logger.exception("could not keep cleanup journal for %s", filename)
+            return f"{CLEANUP_WARNING} (journal:{exc})"
+        return None
+
+    def _finish_confirmed_replace(self, record: Dict[str, Any]) -> Optional[str]:
         filename = record["filename"]
         ingest_id = record["ingest_id"]
         dest = Path(record.get("dest") or (UPLOAD_DIR / filename))
         if not dest.exists():
-            raise RuntimeError("file_swapped but destination PDF is missing")
+            raise RuntimeError("확정된 교체의 PDF가 없습니다. 교체 기록과 백업을 보존합니다.")
         new_ids = record.get("new_ids") or self._ids_for_ingest(filename, ingest_id)
-        if not new_ids:
-            raise RuntimeError("file_swapped but pending chunk ids are missing")
-        self._mark_committed(new_ids, filename, ingest_id)
-        old_ids = self._existing_ids_for_file(filename, exclude_ids=set(new_ids))
-        if old_ids:
-            self.vectorstore.delete(ids=old_ids)
-        self._cleanup_success(filename, record)
+        if new_ids:
+            self._mark_committed(new_ids, filename, ingest_id)
+        elif not self._ids_for_ingest(filename, ingest_id):
+            raise RuntimeError("확정된 교체의 새 chunk를 찾지 못했습니다. 교체 기록을 보존합니다.")
+        return self._cleanup_accepted(filename, record)
 
     def _reconcile_pending(self) -> Dict[str, int]:
         stats = {
             "promoted": 0,
             "rolled_back": 0,
+            "cleaned": 0,
+            "cleanup_pending": 0,
             "orphans_removed": 0,
             "unchanged": 0,
             "errors": 0,
@@ -515,13 +642,13 @@ class RAGEngine:
                 filename = record.get("filename") or ""
                 phase = record.get("phase")
                 try:
-                    if phase == "committed":
-                        self._cleanup_success(filename, record)
-                        stats["unchanged"] += 1
-                    elif phase == "file_swapped":
-                        self._complete_recorded_swap(record)
-                        stats["promoted"] += 1
-                    elif phase in {"started", "pending_added", "rollback_failed"}:
+                    if phase in CONFIRMED_PHASES:
+                        warning = self._finish_confirmed_replace(record)
+                        if warning:
+                            stats["cleanup_pending"] += 1
+                        else:
+                            stats["cleaned"] += 1
+                    elif phase in PRE_CONFIRM_PHASES or phase == "rollback_failed":
                         new_ids = record.get("new_ids") or self._ids_for_ingest(filename, record.get("ingest_id", ""))
                         dest = Path(record.get("dest") or (UPLOAD_DIR / filename))
                         backup = record.get("backup_path")
@@ -584,10 +711,11 @@ class RAGEngine:
         query = self._search_query(question)
         with self._store_lock:
             results = self.vectorstore.similarity_search_with_score(query, k=max(RETRIEVE_K * 3, RETRIEVE_K))
+            confirmed = self._confirmed_ingest_map()
         visible = [
             (doc, float(score))
             for doc, score in results
-            if self._is_visible_meta(doc.metadata) and float(score) <= DISTANCE_THRESHOLD
+            if self._is_visible_meta(doc.metadata, confirmed) and float(score) <= DISTANCE_THRESHOLD
         ]
         return visible[:RETRIEVE_K]
 

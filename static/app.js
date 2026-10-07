@@ -225,6 +225,10 @@ async function pollJob(jobId) {
       if (skipped.length) {
         toast(skipped.map((item) => `${item.name}: ${item.reason}`).join(" / "));
       }
+      const warnings = data.warnings || [];
+      if (warnings.length) {
+        toast(warnings.map((item) => `${item.name}: ${item.reason}`).join(" / "));
+      }
       finishUpload(true);
       return;
     }

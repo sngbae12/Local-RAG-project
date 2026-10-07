@@ -21,6 +21,7 @@ class UploadJob:
     error: Optional[str] = None
     added: List[str] = field(default_factory=list)
     skipped: List[Dict[str, str]] = field(default_factory=list)
+    warnings: List[Dict[str, str]] = field(default_factory=list)
     rejected: List[Dict[str, str]] = field(default_factory=list)
     files: List[Dict[str, Any]] = field(default_factory=list)
     chunk_count: int = 0
@@ -35,6 +36,7 @@ class UploadJob:
             "error": self.error,
             "added": self.added,
             "skipped": self.skipped,
+            "warnings": self.warnings,
             "rejected": self.rejected,
             "files": self.files,
             "chunk_count": self.chunk_count,

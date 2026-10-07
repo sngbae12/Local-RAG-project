@@ -87,6 +87,7 @@ def _run_upload_job(job_id: str, items: list, job_dir: Path) -> None:
             error=error,
             added=result.get("added") or [],
             skipped=result.get("skipped") or [],
+            warnings=result.get("warnings") or [],
             files=result.get("files") or [],
             chunk_count=result.get("chunk_count") or 0,
         )
