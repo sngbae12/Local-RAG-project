@@ -9,6 +9,7 @@ const sendBtn = document.getElementById("send-btn");
 const statusText = document.getElementById("status-text");
 const readyBadge = document.getElementById("ready-badge");
 const newChatBtn = document.getElementById("new-chat");
+const retryBtn = document.getElementById("retry-models");
 const toastEl = document.getElementById("toast");
 
 let busy = false;
@@ -16,6 +17,9 @@ let ready = false;
 let uploading = false;
 let embeddingsReady = false;
 let llmError = "";
+let embeddingError = "";
+let currentJobId = null;
+let jobPollTimer = null;
 
 function updateSendButton() {
   sendBtn.disabled = busy || !questionEl.value.trim();
@@ -32,8 +36,13 @@ function toast(message) {
 function setUploadBusy(on, label) {
   uploading = on;
   uploadArea.classList.toggle("uploading", on);
-  uploadLabel.textContent = label || (on ? "업로드 중…" : "PDF 업로드");
+  uploadLabel.textContent = label || (on ? "처리 중…" : "PDF 업로드");
   fileInput.disabled = on;
+}
+
+function setRetryVisible(on) {
+  retryBtn.classList.toggle("hidden", !on);
+  retryBtn.disabled = on ? false : retryBtn.disabled;
 }
 
 function renderFiles(files) {
@@ -47,7 +56,14 @@ function renderFiles(files) {
   }
   files.forEach((file) => {
     const li = document.createElement("li");
-    li.innerHTML = `<div class="name">${file.name}</div><div class="meta">청크 ${file.chunks}개</div>`;
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = file.name;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `청크 ${file.chunks}개`;
+    li.appendChild(name);
+    li.appendChild(meta);
     fileList.appendChild(li);
   });
 }
@@ -55,33 +71,49 @@ function renderFiles(files) {
 function applyStatus(data) {
   ready = Boolean(data.ready);
   embeddingsReady = Boolean(data.embeddings_ready);
-  llmError = data.error || "";
+  llmError = data.llm_error || (!data.llm_ready ? data.error : "") || "";
+  embeddingError = data.embedding_error || "";
   renderFiles(data.files || []);
   updateSendButton();
+  setRetryVisible(!ready);
 
-  if (data.error && !ready) {
+  if (data.upload_job && (data.upload_job.status === "queued" || data.upload_job.status === "running")) {
+    if (!currentJobId) {
+      currentJobId = data.upload_job.id;
+      pollJob(currentJobId);
+    }
+  }
+
+  if (uploading) return ready;
+
+  if (embeddingError && !embeddingsReady) {
+    readyBadge.className = "badge error";
+    readyBadge.textContent = "임베딩 오류";
+    statusText.textContent = embeddingError;
+    return ready;
+  }
+  if ((llmError || data.error) && !ready) {
     readyBadge.className = "badge error";
     readyBadge.textContent = "LLM 오류";
-    if (!uploading) {
-      statusText.textContent = data.error
-        || (embeddingsReady
-          ? "문서 업로드는 가능합니다. 답변용 LLM은 아직 준비되지 않았습니다."
-          : "모델을 준비하지 못했습니다.");
-    }
+    statusText.textContent = llmError || data.error;
     return ready;
   }
   if (ready) {
     readyBadge.className = "badge ready";
     readyBadge.textContent = "준비됨";
-    if (!uploading) statusText.textContent = "로컬 모델이 준비되었습니다.";
-  } else if (data.embeddings_ready) {
+    statusText.textContent = "로컬 모델이 준비되었습니다.";
+  } else if (data.initializing && data.embeddings_ready) {
     readyBadge.className = "badge waiting";
     readyBadge.textContent = "LLM 로딩";
-    if (!uploading) statusText.textContent = "임베딩은 준비됨. LLM을 불러오는 중입니다.";
+    statusText.textContent = "임베딩은 준비됨. LLM을 불러오는 중입니다.";
+  } else if (data.embeddings_ready) {
+    readyBadge.className = "badge waiting";
+    readyBadge.textContent = "LLM 대기";
+    statusText.textContent = "임베딩은 준비됨. 답변 모델이 아직 준비되지 않았습니다.";
   } else {
     readyBadge.className = "badge waiting";
-    readyBadge.textContent = "준비 중";
-    if (!uploading) statusText.textContent = "모델을 준비하는 중입니다…";
+    readyBadge.textContent = data.initializing ? "준비 중" : "대기";
+    statusText.textContent = "모델을 준비하는 중입니다…";
   }
   return ready;
 }
@@ -108,16 +140,24 @@ function appendMessage(role, text) {
 
 function renderSources(bubble, sources) {
   if (!sources || sources.length === 0) return;
+  if (bubble.querySelector(".sources")) return;
   const wrap = document.createElement("div");
   wrap.className = "sources";
-  wrap.innerHTML = `<div class="sources-title">참고 문서</div>`;
+  const title = document.createElement("div");
+  title.className = "sources-title";
+  title.textContent = "참고 문서";
+  wrap.appendChild(title);
   sources.forEach((src) => {
     const card = document.createElement("div");
     card.className = "source-card";
-    card.innerHTML = `
-      <div class="source-meta">${src.filename} · ${src.page}페이지</div>
-      <div class="source-excerpt">${src.excerpt || ""}</div>
-    `;
+    const meta = document.createElement("div");
+    meta.className = "source-meta";
+    meta.textContent = `${src.filename} · ${src.page}페이지`;
+    const excerpt = document.createElement("div");
+    excerpt.className = "source-excerpt";
+    excerpt.textContent = src.excerpt || "";
+    card.appendChild(meta);
+    card.appendChild(excerpt);
     wrap.appendChild(card);
   });
   bubble.appendChild(wrap);
@@ -134,6 +174,72 @@ async function refreshStatus() {
   }
 }
 
+function finishUpload(ok, message) {
+  if (jobPollTimer) {
+    clearTimeout(jobPollTimer);
+    jobPollTimer = null;
+  }
+  currentJobId = null;
+  fileInput.value = "";
+  setUploadBusy(false);
+  if (!ok && message) statusText.textContent = message;
+  refreshStatus();
+}
+
+function applyJobView(job) {
+  if (!job) return;
+  if (job.status === "queued") {
+    setUploadBusy(true, "대기 중…");
+    statusText.textContent = "문서 처리를 기다리는 중입니다.";
+  } else if (job.status === "running") {
+    const label = job.stage_label || "처리";
+    setUploadBusy(true, `${label} 중…`);
+    statusText.textContent = `${label} 중입니다. 완료까지 시간이 걸릴 수 있습니다.`;
+  }
+}
+
+async function pollJob(jobId) {
+  try {
+    const res = await fetch(`/api/jobs/${jobId}`);
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 404 || data.missing) {
+      toast(data.error || "작업 상태를 찾을 수 없습니다.");
+      finishUpload(false, data.error || "서버가 재시작되어 작업 상태를 잃었습니다.");
+      return;
+    }
+    if (!res.ok) {
+      statusText.textContent = "작업 상태 조회에 실패했습니다. 처리 자체는 계속될 수 있습니다.";
+      jobPollTimer = setTimeout(() => pollJob(jobId), 2000);
+      return;
+    }
+    applyJobView(data);
+    if (data.status === "queued" || data.status === "running") {
+      jobPollTimer = setTimeout(() => pollJob(jobId), 1500);
+      return;
+    }
+    if (data.status === "done") {
+      const added = (data.added || []).length;
+      toast(`${added}개 파일을 저장했습니다.`);
+      renderFiles(data.files || []);
+      const skipped = [...(data.skipped || []), ...(data.rejected || [])];
+      if (skipped.length) {
+        toast(skipped.map((item) => `${item.name}: ${item.reason}`).join(" / "));
+      }
+      finishUpload(true);
+      return;
+    }
+    toast(data.error || "업로드에 실패했습니다.");
+    const skipped = [...(data.skipped || []), ...(data.rejected || [])];
+    if (skipped.length) {
+      toast(skipped.map((item) => `${item.name}: ${item.reason}`).join(" / "));
+    }
+    finishUpload(false, data.error || "업로드에 실패했습니다.");
+  } catch (err) {
+    statusText.textContent = "작업 상태 조회에 실패했습니다. 처리 자체는 계속될 수 있습니다.";
+    jobPollTimer = setTimeout(() => pollJob(jobId), 2000);
+  }
+}
+
 async function uploadFiles(fileListLike) {
   const files = Array.from(fileListLike || []).filter(Boolean);
   if (!files.length) {
@@ -145,39 +251,30 @@ async function uploadFiles(fileListLike) {
     toast("PDF 파일만 업로드할 수 있습니다.");
     return;
   }
-  if (uploading) {
+  if (uploading || currentJobId) {
     toast("이미 업로드를 처리 중입니다.");
     return;
   }
 
   const formData = new FormData();
   files.forEach((file) => formData.append("files", file, file.name));
-  setUploadBusy(true, "임베딩 중…");
-  statusText.textContent = `${files.length}개 문서를 읽고 임베딩하는 중입니다. 완료까지 시간이 걸릴 수 있습니다.`;
+  setUploadBusy(true, "업로드 중…");
+  statusText.textContent = `${files.length}개 문서 처리를 등록하는 중입니다.`;
 
   try {
     const res = await fetch("/api/upload", { method: "POST", body: formData });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) {
+    if (!res.ok || !data.ok || !data.job_id) {
       toast(data.error || "업로드에 실패했습니다.");
-      statusText.textContent = data.error || "업로드에 실패했습니다.";
-    } else {
-      const added = (data.added || []).length;
-      toast(`${added}개 파일을 저장했습니다.`);
-      renderFiles(data.files || []);
-      statusText.textContent = `${added}개 파일을 벡터 DB에 저장했습니다.`;
-      const skipped = [...(data.skipped || []), ...(data.rejected || [])];
-      if (skipped.length) {
-        toast(skipped.map((s) => `${s.name}: ${s.reason}`).join(" / "));
-      }
+      finishUpload(false, data.error || "업로드에 실패했습니다.");
+      return;
     }
+    currentJobId = data.job_id;
+    applyJobView(data);
+    pollJob(currentJobId);
   } catch (err) {
     toast("서버와 연결하지 못했습니다. 앱이 실행 중인지 확인하세요.");
-    statusText.textContent = "업로드 중 서버 연결에 실패했습니다.";
-  } finally {
-    fileInput.value = "";
-    setUploadBusy(false);
-    refreshStatus();
+    finishUpload(false, "업로드 중 서버 연결에 실패했습니다.");
   }
 }
 
@@ -210,6 +307,9 @@ async function sendChat() {
     toast(llmError || "모델이 아직 준비되지 않았습니다. 잠시 후 다시 시도하세요.");
     return;
   }
+  if (uploading || currentJobId) {
+    toast("업로드 중인 문서는 아직 검색에 포함되지 않습니다. 기존 문서에 대해서만 질문합니다.");
+  }
 
   busy = true;
   updateSendButton();
@@ -218,6 +318,8 @@ async function sendChat() {
   appendMessage("user", message);
   const assistant = appendMessage("assistant", "답변을 생성하는 중입니다…");
   let started = false;
+  let finished = false;
+  let sawError = false;
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -253,11 +355,17 @@ async function sendChat() {
           assistant.content.textContent += payload.text || "";
           messagesEl.scrollTop = messagesEl.scrollHeight;
         } else if (payload.type === "done") {
+          finished = true;
+          if (payload.answer) assistant.content.textContent = payload.answer;
           if (!payload.no_info) renderSources(assistant.bubble, sources);
         } else if (payload.type === "error") {
+          sawError = true;
           assistant.content.textContent = payload.error || "오류가 발생했습니다.";
         }
       }
+    }
+    if (!finished && !sawError) {
+      assistant.content.textContent = "응답이 완료되지 않았습니다. 다시 시도하세요.";
     }
   } catch (err) {
     assistant.content.textContent = "서버 연결에 실패했습니다.";
@@ -275,13 +383,35 @@ form.addEventListener("submit", (event) => {
 
 newChatBtn.addEventListener("click", async () => {
   await fetch("/api/reset", { method: "POST" });
-  messagesEl.innerHTML = `
-    <div class="welcome" id="welcome">
-      <h3>PDF를 업로드한 뒤 질문해 보세요</h3>
-      <p>왼쪽에서 문서를 올리면, 해당 내용과 페이지를 근거로 답변합니다.</p>
-    </div>
-  `;
+  messagesEl.innerHTML = "";
+  const welcome = document.createElement("div");
+  welcome.className = "welcome";
+  welcome.id = "welcome";
+  const heading = document.createElement("h3");
+  heading.textContent = "PDF를 업로드한 뒤 질문해 보세요";
+  const desc = document.createElement("p");
+  desc.textContent = "왼쪽에서 문서를 올리면, 해당 내용과 페이지를 근거로 답변합니다.";
+  welcome.appendChild(heading);
+  welcome.appendChild(desc);
+  messagesEl.appendChild(welcome);
   toast("새 대화를 시작합니다.");
+});
+
+retryBtn.addEventListener("click", async () => {
+  retryBtn.disabled = true;
+  statusText.textContent = "모델을 다시 불러오는 중입니다…";
+  try {
+    const res = await fetch("/api/retry-models", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    applyStatus(data);
+    if (!data.ready) {
+      toast(data.llm_error || data.error || "모델이 아직 준비되지 않았습니다.");
+    }
+  } catch (err) {
+    toast("모델 재시도 요청에 실패했습니다.");
+  } finally {
+    retryBtn.disabled = false;
+  }
 });
 
 questionEl.addEventListener("keydown", (event) => {
@@ -299,7 +429,7 @@ questionEl.addEventListener("input", () => {
 
 async function pollUntilReady() {
   await refreshStatus();
-  if (!ready && !llmError) setTimeout(pollUntilReady, 2500);
+  if (!ready) setTimeout(pollUntilReady, llmError || embeddingError ? 8000 : 2500);
 }
 
 pollUntilReady();

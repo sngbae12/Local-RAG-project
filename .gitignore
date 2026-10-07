@@ -44,8 +44,13 @@ models/requirements.txt
 # User uploads and vector store (document contents)
 uploads/*
 !uploads/.gitkeep
+uploads/.tmp/
 chroma_db/*
 !chroma_db/.gitkeep
+chroma_db_backup*/
+
+# Local verification venv
+.venv-check/
 
 # Local conversation/test artifacts
 test_results/

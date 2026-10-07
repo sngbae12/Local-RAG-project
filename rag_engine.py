@@ -1,8 +1,9 @@
 import os
 import site
 import threading
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from langchain_chroma import Chroma
 from langchain_classic.memory import ConversationBufferMemory
@@ -23,6 +24,7 @@ from config import (
     NO_INFO_MESSAGE,
     RETRIEVE_K,
     SEPARATORS,
+    TMP_UPLOAD_DIR,
     UPLOAD_DIR,
 )
 
@@ -124,45 +126,65 @@ class RAGEngine:
         self.llm_ready = False
         self.embeddings_ready = False
         self.error: Optional[str] = None
+        self.embedding_error: Optional[str] = None
+        self.llm_error: Optional[str] = None
+        self.initializing = False
+        self._store_lock = threading.RLock()
 
     def initialize(self) -> None:
         with self._lock:
             if self.ready:
                 return
-            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            if self.initializing:
+                return
+            self.initializing = True
+        try:
+            self._initialize_body()
+        finally:
+            with self._lock:
+                self.initializing = False
 
-            if self.embeddings is None:
-                try:
-                    self._load_embeddings()
-                    self.embeddings_ready = True
-                except Exception as exc:
-                    self.error = f"임베딩 모델 로딩 실패: {exc}"
-                    raise
-            if self.vectorstore is None:
-                self._load_vectorstore()
+    def _initialize_body(self) -> None:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        TMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
-            if self.llm is None:
-                try:
-                    self._load_llm()
-                    self.llm_ready = True
-                    self.error = None
-                except Exception as exc:
-                    self.llm_ready = False
-                    detail = str(exc)
-                    if "llama.dll" in detail or "shared library" in detail.lower():
-                        self.error = (
-                            "llama-cpp-python이 필요한 DLL을 찾지 못해 GGUF LLM을 불러오지 못했습니다. "
-                            "CPU용 휠을 설치하세요: pip install llama-cpp-python==0.3.33 "
-                            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu"
-                        )
-                    else:
-                        self.error = f"LLM 로딩 실패: {detail}"
-                    self.ready = False
-                    return
+        if self.embeddings is None:
+            try:
+                self._load_embeddings()
+                self.embeddings_ready = True
+                self.embedding_error = None
+            except Exception as exc:
+                self.embeddings_ready = False
+                self.embedding_error = f"임베딩 모델 로딩 실패: {exc}"
+                self.error = self.embedding_error
+                raise
+        if self.vectorstore is None:
+            self._load_vectorstore()
+            self._reconcile_pending()
 
-            self.ready = True
-            self.error = None
+        if self.llm is None:
+            try:
+                self._load_llm()
+                self.llm_ready = True
+                self.llm_error = None
+            except Exception as exc:
+                self.llm_ready = False
+                detail = str(exc)
+                if "llama.dll" in detail or "shared library" in detail.lower():
+                    self.llm_error = (
+                        "llama-cpp-python이 필요한 DLL을 찾지 못해 GGUF LLM을 불러오지 못했습니다. "
+                        "CPU용 휠을 설치하세요: pip install llama-cpp-python==0.3.33 "
+                        "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu"
+                    )
+                else:
+                    self.llm_error = f"LLM 로딩 실패: {detail}"
+                self.error = self.llm_error
+                self.ready = False
+                return
+
+        self.ready = True
+        self.error = None
 
     def _load_embeddings(self) -> None:
         if not EMBEDDING_PATH.exists():
@@ -210,21 +232,32 @@ class RAGEngine:
         except Exception:
             return 0
 
+    def _is_visible_meta(self, meta: Optional[Dict[str, Any]]) -> bool:
+        status = (meta or {}).get("ingest_status") or "committed"
+        return status == "committed"
+
     def list_files(self) -> List[Dict[str, Any]]:
         if self.vectorstore is None:
             return []
-        try:
-            data = self.vectorstore.get(include=["metadatas"])
-        except Exception:
-            return []
+        with self._store_lock:
+            try:
+                data = self.vectorstore.get(include=["metadatas"])
+            except Exception:
+                return []
         counts: Dict[str, int] = {}
         for meta in data.get("metadatas") or []:
+            if not self._is_visible_meta(meta):
+                continue
             name = (meta or {}).get("filename") or Path((meta or {}).get("source", "")).name
             if name:
                 counts[name] = counts.get(name, 0) + 1
         return [{"name": name, "chunks": counts[name]} for name in sorted(counts)]
 
-    def ingest_pdfs(self, file_paths: List[Path]) -> Dict[str, Any]:
+    def ingest_pdfs(
+        self,
+        items: List[Tuple[Path, str]],
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
         if self.vectorstore is None:
             raise RuntimeError("벡터 DB가 아직 준비되지 않았습니다.")
 
@@ -232,29 +265,11 @@ class RAGEngine:
         skipped: List[Dict[str, str]] = []
         total_chunks = 0
 
-        for path in file_paths:
-            filename = path.name
+        for temp_path, filename in items:
             try:
-                loader = PyPDFLoader(str(path))
-                pages = loader.load()
-                if not pages or not any((p.page_content or "").strip() for p in pages):
-                    skipped.append({"name": filename, "reason": "텍스트를 추출할 수 없는 PDF입니다."})
-                    continue
-
-                for page in pages:
-                    page.metadata["filename"] = filename
-                    page.metadata["source"] = filename
-                    page.metadata["page_number"] = _page_number(page.metadata)
-
-                chunks = self.splitter.split_documents(pages)
-                chunks = [c for c in chunks if (c.page_content or "").strip()]
-                if not chunks:
-                    skipped.append({"name": filename, "reason": "분할할 텍스트가 없습니다."})
-                    continue
-
-                self._replace_file_chunks(filename, chunks)
+                chunk_count = self._ingest_one(temp_path, filename, progress)
                 added_files.append(filename)
-                total_chunks += len(chunks)
+                total_chunks += chunk_count
             except Exception as exc:
                 skipped.append({"name": filename, "reason": str(exc)})
 
@@ -265,16 +280,126 @@ class RAGEngine:
             "files": self.list_files(),
         }
 
-    def _replace_file_chunks(self, filename: str, chunks: List[Document]) -> None:
+    def _notify(self, progress: Optional[Callable[[str], None]], stage: str) -> None:
+        if progress:
+            progress(stage)
+
+    def _ingest_one(
+        self,
+        temp_path: Path,
+        filename: str,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> int:
+        self._notify(progress, "extract")
+        loader = PyPDFLoader(str(temp_path))
+        pages = loader.load()
+        if not pages or not any((p.page_content or "").strip() for p in pages):
+            raise RuntimeError("텍스트를 추출할 수 없는 PDF입니다.")
+
+        for page in pages:
+            page.metadata["filename"] = filename
+            page.metadata["source"] = filename
+            page.metadata["page_number"] = _page_number(page.metadata)
+
+        self._notify(progress, "chunk")
+        chunks = self.splitter.split_documents(pages)
+        chunks = [c for c in chunks if (c.page_content or "").strip()]
+        if not chunks:
+            raise RuntimeError("분할할 텍스트가 없습니다.")
+
+        dest = UPLOAD_DIR / filename
+        self._commit_chunks_and_file(filename, chunks, temp_path, dest, progress)
+        return len(chunks)
+
+    def _commit_chunks_and_file(
+        self,
+        filename: str,
+        chunks: List[Document],
+        temp_path: Path,
+        dest: Path,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> None:
         assert self.vectorstore is not None
+        ingest_id = uuid.uuid4().hex
+        new_ids = [f"ing-{ingest_id}-{idx:06d}" for idx in range(len(chunks))]
+        for chunk in chunks:
+            chunk.metadata["filename"] = filename
+            chunk.metadata["source"] = filename
+            chunk.metadata["ingest_id"] = ingest_id
+            chunk.metadata["ingest_status"] = "pending"
+
+        with self._store_lock:
+            self._notify(progress, "embed")
+            self.vectorstore.add_documents(chunks, ids=new_ids)
+            self._notify(progress, "store")
+            old_ids = self._existing_ids_for_file(filename, exclude_ids=set(new_ids))
+            if old_ids:
+                self.vectorstore.delete(ids=old_ids)
+            self._mark_committed(new_ids, filename, ingest_id)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temp_path, dest)
+
+    def _existing_ids_for_file(self, filename: str, exclude_ids: Optional[set] = None) -> List[str]:
+        assert self.vectorstore is not None
+        exclude_ids = exclude_ids or set()
         try:
             existing = self.vectorstore.get(where={"filename": filename})
-            ids = existing.get("ids") or []
-            if ids:
-                self.vectorstore.delete(ids=ids)
         except Exception:
-            pass
-        self.vectorstore.add_documents(chunks)
+            return []
+        ids = existing.get("ids") or []
+        return [doc_id for doc_id in ids if doc_id not in exclude_ids]
+
+    def _mark_committed(self, ids: List[str], filename: str, ingest_id: str) -> None:
+        assert self.vectorstore is not None
+        if not ids:
+            return
+        try:
+            data = self.vectorstore.get(ids=ids, include=["metadatas"])
+            metas = data.get("metadatas") or []
+        except Exception:
+            metas = [None] * len(ids)
+        updated = []
+        for meta in metas:
+            item = dict(meta or {})
+            item["filename"] = filename
+            item["source"] = filename
+            item["ingest_id"] = ingest_id
+            item["ingest_status"] = "committed"
+            updated.append(item)
+        self.vectorstore._collection.update(ids=ids, metadatas=updated)
+
+    def _reconcile_pending(self) -> None:
+        if self.vectorstore is None:
+            return
+        with self._store_lock:
+            try:
+                data = self.vectorstore.get(include=["metadatas"])
+            except Exception:
+                return
+            ids = data.get("ids") or []
+            metas = data.get("metadatas") or []
+            by_file: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+            for doc_id, meta in zip(ids, metas):
+                meta = meta or {}
+                name = meta.get("filename") or Path(str(meta.get("source", ""))).name
+                if not name:
+                    continue
+                by_file.setdefault(name, []).append((doc_id, meta))
+            for filename, items in by_file.items():
+                committed = [doc_id for doc_id, meta in items if self._is_visible_meta(meta)]
+                pending = [
+                    (doc_id, meta)
+                    for doc_id, meta in items
+                    if (meta.get("ingest_status") == "pending")
+                ]
+                if pending and not committed:
+                    ingest_id = pending[0][1].get("ingest_id") or "recovered"
+                    self._mark_committed([doc_id for doc_id, _ in pending], filename, ingest_id)
+                elif pending and committed:
+                    try:
+                        self.vectorstore.delete(ids=[doc_id for doc_id, _ in pending])
+                    except Exception:
+                        pass
 
     def _search_query(self, question: str) -> str:
         messages = self.memory.buffer_as_messages
@@ -291,9 +416,14 @@ class RAGEngine:
         if self.vectorstore is None or self._collection_count() == 0:
             return []
         query = self._search_query(question)
-        results = self.vectorstore.similarity_search_with_score(query, k=RETRIEVE_K)
-        relevant = [(doc, float(score)) for doc, score in results if float(score) <= DISTANCE_THRESHOLD]
-        return relevant
+        with self._store_lock:
+            results = self.vectorstore.similarity_search_with_score(query, k=max(RETRIEVE_K * 3, RETRIEVE_K))
+        visible = [
+            (doc, float(score))
+            for doc, score in results
+            if self._is_visible_meta(doc.metadata) and float(score) <= DISTANCE_THRESHOLD
+        ]
+        return visible[:RETRIEVE_K]
 
     def sources_payload(self, pairs: List[Tuple[Document, float]]) -> List[Dict[str, Any]]:
         payload: List[Dict[str, Any]] = []

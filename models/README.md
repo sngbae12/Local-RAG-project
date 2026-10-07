@@ -28,7 +28,12 @@ models/
 - 파일명: `EXAONE-3.5-2.4B-Instruct-Q5_K_M.gguf`
 - 배치: `models/exaone_2.4b/EXAONE-3.5-2.4B-Instruct-Q5_K_M.gguf`
 - 로더: `llama-cpp-python` / LangChain `LlamaCpp`
-- 이 저장소의 로컬 캐시 메타데이터에는 다운로드 URL이 없고 파일 해시만 있습니다. 배포처는 해당 파일명으로 직접 확인하세요.
+- 공개 저장소: [LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct-GGUF](https://huggingface.co/LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct-GGUF)
+- 라이선스: EXAONE AI Model License Agreement 1.1 - NC (모델 카드 기준)
+
+```bat
+huggingface-cli download LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct-GGUF EXAONE-3.5-2.4B-Instruct-Q5_K_M.gguf --local-dir models/exaone_2.4b
+```
 
 ## 임베딩 (BGE-M3)
 

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PDF RAG Chat</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=3" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=6" />
 </head>
 <body>
   <div class="app">
@@ -32,6 +32,7 @@
       </div>
 
       <button id="new-chat" class="ghost-btn" type="button">새 대화</button>
+      <button id="retry-models" class="ghost-btn hidden" type="button">모델 다시 시도</button>
       <div id="status-text" class="status">모델을 준비하는 중입니다…</div>
     </aside>
 
@@ -56,6 +57,6 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='app.js') }}?v=5"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=6"></script>
 </body>
 </html>

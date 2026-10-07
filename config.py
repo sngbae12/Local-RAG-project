@@ -5,6 +5,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LLM_PATH = BASE_DIR / "models" / "exaone_2.4b" / "EXAONE-3.5-2.4B-Instruct-Q5_K_M.gguf"
 EMBEDDING_PATH = BASE_DIR / "models" / "bge-m3"
 UPLOAD_DIR = BASE_DIR / "uploads"
+TMP_UPLOAD_DIR = UPLOAD_DIR / ".tmp"
 CHROMA_DIR = BASE_DIR / "chroma_db"
 
 CHUNK_SIZE = 500
