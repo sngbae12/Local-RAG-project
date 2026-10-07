@@ -1,0 +1,58 @@
+# Python
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+.DS_Store
+Thumbs.db
+
+# Large model weights and caches
+models/**/*.gguf
+models/**/*.bin
+models/**/*.onnx
+models/**/*.pt
+models/**/*.safetensors
+models/**/.cache/
+models/bge-m3/**
+models/exaone_2.4b/**
+!models/bge-m3/.gitkeep
+!models/exaone_2.4b/.gitkeep
+models/requirements.txt
+
+# User uploads and vector store (document contents)
+uploads/*
+!uploads/.gitkeep
+chroma_db/*
+!chroma_db/.gitkeep
+
+# Local conversation/test artifacts
+test_results/
+.coverage
+htmlcov/
+
+# Editor
+.idea/
+.vscode/
+*.swp

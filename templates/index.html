@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF RAG Chat</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=3" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">RAG</div>
+        <div>
+          <h1>PDF Chat</h1>
+          <p>로컬 문서 질의응답</p>
+        </div>
+      </div>
+
+      <label class="upload-btn" id="upload-area">
+        <input id="file-input" type="file" accept=".pdf,application/pdf" multiple />
+        <span class="upload-icon">＋</span>
+        <span id="upload-label">PDF 업로드</span>
+      </label>
+      <p class="hint">PDF만 가능합니다. 업로드 후 임베딩에 시간이 걸릴 수 있습니다.</p>
+
+      <div class="file-section">
+        <div class="section-title">업로드된 문서</div>
+        <ul id="file-list" class="file-list">
+          <li class="empty">아직 업로드된 파일이 없습니다.</li>
+        </ul>
+      </div>
+
+      <button id="new-chat" class="ghost-btn" type="button">새 대화</button>
+      <div id="status-text" class="status">모델을 준비하는 중입니다…</div>
+    </aside>
+
+    <main class="chat-panel">
+      <header class="chat-header">
+        <h2>문서 기반 챗봇</h2>
+        <span id="ready-badge" class="badge waiting">준비 중</span>
+      </header>
+
+      <section id="messages" class="messages">
+        <div class="welcome" id="welcome">
+          <h3>PDF를 업로드한 뒤 질문해 보세요</h3>
+          <p>왼쪽에서 문서를 올리면, 해당 내용과 페이지를 근거로 답변합니다.</p>
+        </div>
+      </section>
+
+      <form id="chat-form" class="composer">
+        <textarea id="question" rows="1" placeholder="메시지를 입력하세요" required></textarea>
+        <button id="send-btn" type="submit" aria-label="전송">➤</button>
+      </form>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="{{ url_for('static', filename='app.js') }}?v=5"></script>
+</body>
+</html>
