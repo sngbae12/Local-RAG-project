@@ -81,5 +81,18 @@ class JobStore:
                 self._active_id = None
             return job
 
+    def fail(self, job_id: str, error: str, **fields: Any) -> Optional[UploadJob]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.status = "failed"
+                job.stage = None
+                job.error = error
+                for key, value in fields.items():
+                    setattr(job, key, value)
+            if self._active_id == job_id:
+                self._active_id = None
+            return job
+
 
 job_store = JobStore()

@@ -21,6 +21,15 @@ class JobStoreTests(unittest.TestCase):
         self.assertIsNone(store.get("missing"))
         self.assertFalse(store.has_active())
 
+    def test_fail_releases_active_lock(self):
+        store = JobStore()
+        job = store.create()
+        store.fail(job.id, "준비 실패")
+        self.assertFalse(store.has_active())
+        self.assertEqual(store.get(job.id).status, "failed")
+        again = store.create()
+        self.assertNotEqual(again.id, job.id)
+
 
 class StreamDoneTests(unittest.TestCase):
     def test_no_info_path_emits_normalized_done_answer(self):

@@ -142,10 +142,10 @@ def upload():
         job = job_store.create()
     except RuntimeError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 409
-    job_dir = TMP_UPLOAD_DIR / job.id
-    job_dir.mkdir(parents=True, exist_ok=True)
 
+    job_dir = TMP_UPLOAD_DIR / job.id
     try:
+        job_dir.mkdir(parents=True, exist_ok=True)
         for file in files:
             original = file.filename or ""
             if not original:
@@ -165,24 +165,31 @@ def upload():
                 rejected.append({"name": original, "reason": "올바른 PDF 파일이 아닙니다."})
                 continue
             items.append((temp_path, filename))
+
+        job_store.update(job.id, rejected=rejected)
+        if not items:
+            failed = job_store.fail(
+                job.id,
+                "허용되지 않은 파일입니다." if rejected else "PDF 파일이 전달되지 않았습니다. 버튼을 눌러 다시 선택하세요.",
+                skipped=rejected,
+            )
+            _cleanup_job_dir(job_dir)
+            return jsonify({"ok": False, "job_id": job.id, **failed.to_dict()}), 400
+
+        try:
+            threading.Thread(target=_run_upload_job, args=(job.id, items, job_dir), daemon=True).start()
+        except Exception:
+            logger.exception("upload thread start failed")
+            failed = job_store.fail(job.id, "문서 처리를 시작하지 못했습니다.")
+            _cleanup_job_dir(job_dir)
+            return jsonify({"ok": False, "job_id": job.id, **failed.to_dict()}), 500
+        return jsonify({"ok": True, "job_id": job.id, **job.to_dict()})
     except Exception:
-        job_store.update(job.id, status="failed", error="업로드 파일을 저장하지 못했습니다.")
+        logger.exception("upload preparation failed")
+        failed = job_store.fail(job.id, "업로드 준비에 실패했습니다.")
         _cleanup_job_dir(job_dir)
-        raise
-
-    job_store.update(job.id, rejected=rejected)
-    if not items:
-        job_store.update(
-            job.id,
-            status="failed",
-            error="허용되지 않은 파일입니다." if rejected else "PDF 파일이 전달되지 않았습니다. 버튼을 눌러 다시 선택하세요.",
-            skipped=rejected,
-        )
-        _cleanup_job_dir(job_dir)
-        return jsonify({"ok": False, "job_id": job.id, **job_store.get(job.id).to_dict()}), 400
-
-    threading.Thread(target=_run_upload_job, args=(job.id, items, job_dir), daemon=True).start()
-    return jsonify({"ok": True, "job_id": job.id, **job.to_dict()})
+        payload = failed.to_dict() if failed else {"error": "업로드 준비에 실패했습니다."}
+        return jsonify({"ok": False, "job_id": job.id, **payload}), 500
 
 
 @app.route("/api/jobs/<job_id>")

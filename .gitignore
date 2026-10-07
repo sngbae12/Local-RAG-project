@@ -45,6 +45,8 @@ models/requirements.txt
 uploads/*
 !uploads/.gitkeep
 uploads/.tmp/
+uploads/.swap/
+uploads/.versions/
 chroma_db/*
 !chroma_db/.gitkeep
 chroma_db_backup*/

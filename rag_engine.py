@@ -1,4 +1,6 @@
+import logging
 import os
+import shutil
 import site
 import threading
 import uuid
@@ -24,9 +26,14 @@ from config import (
     NO_INFO_MESSAGE,
     RETRIEVE_K,
     SEPARATORS,
+    SWAP_DIR,
     TMP_UPLOAD_DIR,
     UPLOAD_DIR,
+    VERSION_DIR,
 )
+from ingest_journal import clear_record, list_records, read_record, write_record
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "당신은 PDF 문서 기반 질의응답 도우미입니다. "
@@ -147,6 +154,8 @@ class RAGEngine:
     def _initialize_body(self) -> None:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         TMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        SWAP_DIR.mkdir(parents=True, exist_ok=True)
+        VERSION_DIR.mkdir(parents=True, exist_ok=True)
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
         if self.embeddings is None:
@@ -161,7 +170,8 @@ class RAGEngine:
                 raise
         if self.vectorstore is None:
             self._load_vectorstore()
-            self._reconcile_pending()
+            stats = self._reconcile_pending()
+            logger.info("ingest reconcile %s", stats)
 
         if self.llm is None:
             try:
@@ -328,16 +338,123 @@ class RAGEngine:
             chunk.metadata["ingest_id"] = ingest_id
             chunk.metadata["ingest_status"] = "pending"
 
+        record: Dict[str, Any] = {
+            "filename": filename,
+            "ingest_id": ingest_id,
+            "phase": "started",
+            "dest": str(dest),
+            "backup_path": None,
+            "new_ids": new_ids,
+        }
+        write_record(filename, record)
+        file_swapped = False
+
         with self._store_lock:
-            self._notify(progress, "embed")
-            self.vectorstore.add_documents(chunks, ids=new_ids)
-            self._notify(progress, "store")
-            old_ids = self._existing_ids_for_file(filename, exclude_ids=set(new_ids))
-            if old_ids:
-                self.vectorstore.delete(ids=old_ids)
-            self._mark_committed(new_ids, filename, ingest_id)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(temp_path, dest)
+            try:
+                if dest.exists():
+                    VERSION_DIR.mkdir(parents=True, exist_ok=True)
+                    backup = VERSION_DIR / f"{filename}.{ingest_id}.bak.pdf"
+                    shutil.copy2(dest, backup)
+                    record["backup_path"] = str(backup)
+                    write_record(filename, record)
+
+                self._notify(progress, "embed")
+                self.vectorstore.add_documents(chunks, ids=new_ids)
+                record["phase"] = "pending_added"
+                write_record(filename, record)
+
+                self._notify(progress, "store")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temp_path, dest)
+                file_swapped = True
+                record["phase"] = "file_swapped"
+                write_record(filename, record)
+
+                self._mark_committed(new_ids, filename, ingest_id)
+                old_ids = self._existing_ids_for_file(filename, exclude_ids=set(new_ids))
+                if old_ids:
+                    self.vectorstore.delete(ids=old_ids)
+                record["phase"] = "committed"
+                write_record(filename, record)
+                self._cleanup_success(filename, record)
+            except Exception as exc:
+                self._rollback_replace(filename, new_ids, record, dest, file_swapped)
+                raise RuntimeError(f"문서 교체에 실패해 이전 문서를 유지합니다: {exc}") from exc
+
+    def _cleanup_success(self, filename: str, record: Dict[str, Any]) -> None:
+        backup = record.get("backup_path")
+        if backup:
+            Path(backup).unlink(missing_ok=True)
+        clear_record(filename)
+
+    def _delete_ids_quiet(self, ids: List[str]) -> None:
+        if not ids or self.vectorstore is None:
+            return
+        self.vectorstore.delete(ids=ids)
+
+    def _rollback_replace(
+        self,
+        filename: str,
+        new_ids: List[str],
+        record: Dict[str, Any],
+        dest: Path,
+        file_swapped: bool,
+    ) -> None:
+        pending_error = None
+        file_error = None
+        try:
+            self._delete_ids_quiet(new_ids)
+        except Exception as exc:
+            pending_error = exc
+
+        if file_swapped:
+            backup = record.get("backup_path")
+            if backup and Path(backup).exists():
+                try:
+                    os.replace(backup, dest)
+                except Exception as exc:
+                    file_error = exc
+                    record["phase"] = "rollback_failed"
+                    record["rollback_error"] = "file_restore_failed"
+                    write_record(filename, record)
+            elif dest.exists() and not backup:
+                try:
+                    dest.unlink()
+                except Exception as exc:
+                    file_error = exc
+                    record["phase"] = "rollback_failed"
+                    record["rollback_error"] = "new_file_delete_failed"
+                    write_record(filename, record)
+
+        if pending_error:
+            record["phase"] = "rollback_failed"
+            record["rollback_error"] = "pending_delete_failed"
+            write_record(filename, record)
+            raise RuntimeError(
+                f"문서 교체 실패 후 새 chunk를 정리하지 못했습니다. 교체 기록을 보존합니다: {pending_error}"
+            ) from pending_error
+        if file_error:
+            backup = record.get("backup_path")
+            raise RuntimeError(
+                "검색 데이터는 이전 문서로 되돌렸지만 PDF 복구에 실패했습니다. "
+                f"백업 경로를 보존합니다: {backup}"
+            ) from file_error
+
+        backup = record.get("backup_path")
+        if backup and Path(backup).exists() and dest.exists() and not file_swapped:
+            Path(backup).unlink(missing_ok=True)
+        if record.get("phase") != "rollback_failed":
+            clear_record(filename)
+
+    def _ids_for_ingest(self, filename: str, ingest_id: str) -> List[str]:
+        assert self.vectorstore is not None
+        try:
+            existing = self.vectorstore.get(where={"filename": filename}, include=["metadatas"])
+        except Exception:
+            return []
+        ids = existing.get("ids") or []
+        metas = existing.get("metadatas") or []
+        return [doc_id for doc_id, meta in zip(ids, metas) if (meta or {}).get("ingest_id") == ingest_id]
 
     def _existing_ids_for_file(self, filename: str, exclude_ids: Optional[set] = None) -> List[str]:
         assert self.vectorstore is not None
@@ -368,14 +485,59 @@ class RAGEngine:
             updated.append(item)
         self.vectorstore._collection.update(ids=ids, metadatas=updated)
 
-    def _reconcile_pending(self) -> None:
+    def _complete_recorded_swap(self, record: Dict[str, Any]) -> None:
+        filename = record["filename"]
+        ingest_id = record["ingest_id"]
+        dest = Path(record.get("dest") or (UPLOAD_DIR / filename))
+        if not dest.exists():
+            raise RuntimeError("file_swapped but destination PDF is missing")
+        new_ids = record.get("new_ids") or self._ids_for_ingest(filename, ingest_id)
+        if not new_ids:
+            raise RuntimeError("file_swapped but pending chunk ids are missing")
+        self._mark_committed(new_ids, filename, ingest_id)
+        old_ids = self._existing_ids_for_file(filename, exclude_ids=set(new_ids))
+        if old_ids:
+            self.vectorstore.delete(ids=old_ids)
+        self._cleanup_success(filename, record)
+
+    def _reconcile_pending(self) -> Dict[str, int]:
+        stats = {
+            "promoted": 0,
+            "rolled_back": 0,
+            "orphans_removed": 0,
+            "unchanged": 0,
+            "errors": 0,
+        }
         if self.vectorstore is None:
-            return
+            return stats
         with self._store_lock:
+            for record in list_records():
+                filename = record.get("filename") or ""
+                phase = record.get("phase")
+                try:
+                    if phase == "committed":
+                        self._cleanup_success(filename, record)
+                        stats["unchanged"] += 1
+                    elif phase == "file_swapped":
+                        self._complete_recorded_swap(record)
+                        stats["promoted"] += 1
+                    elif phase in {"started", "pending_added", "rollback_failed"}:
+                        new_ids = record.get("new_ids") or self._ids_for_ingest(filename, record.get("ingest_id", ""))
+                        dest = Path(record.get("dest") or (UPLOAD_DIR / filename))
+                        backup = record.get("backup_path")
+                        should_restore = bool(backup and Path(backup).exists())
+                        self._rollback_replace(filename, new_ids, record, dest, file_swapped=should_restore)
+                        stats["rolled_back"] += 1
+                    else:
+                        stats["unchanged"] += 1
+                except Exception:
+                    stats["errors"] += 1
+                    logger.exception("ingest reconcile failed for %s", filename)
+
             try:
                 data = self.vectorstore.get(include=["metadatas"])
             except Exception:
-                return
+                return stats
             ids = data.get("ids") or []
             metas = data.get("metadatas") or []
             by_file: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
@@ -386,20 +548,24 @@ class RAGEngine:
                     continue
                 by_file.setdefault(name, []).append((doc_id, meta))
             for filename, items in by_file.items():
-                committed = [doc_id for doc_id, meta in items if self._is_visible_meta(meta)]
-                pending = [
-                    (doc_id, meta)
+                if read_record(filename):
+                    stats["unchanged"] += 1
+                    continue
+                pending_ids = [
+                    doc_id
                     for doc_id, meta in items
                     if (meta.get("ingest_status") == "pending")
                 ]
-                if pending and not committed:
-                    ingest_id = pending[0][1].get("ingest_id") or "recovered"
-                    self._mark_committed([doc_id for doc_id, _ in pending], filename, ingest_id)
-                elif pending and committed:
-                    try:
-                        self.vectorstore.delete(ids=[doc_id for doc_id, _ in pending])
-                    except Exception:
-                        pass
+                if not pending_ids:
+                    continue
+                try:
+                    self._delete_ids_quiet(pending_ids)
+                    stats["orphans_removed"] += 1
+                    logger.info("removed orphan pending chunks filename=%s count=%s", filename, len(pending_ids))
+                except Exception:
+                    stats["errors"] += 1
+                    logger.exception("orphan pending cleanup failed for %s", filename)
+        return stats
 
     def _search_query(self, question: str) -> str:
         messages = self.memory.buffer_as_messages
